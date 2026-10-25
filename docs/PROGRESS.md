@@ -1,129 +1,171 @@
 # Progress — vsnvi-food
 
-> Drafted from defaults — review and adjust. Tick items as they are merged.
+Tick items once they are merged. Every module follows the same definition of done:
+**migration → domain → infrastructure → application → api → tests**.
 
-Each module follows the same definition of done: **migration → domain → service → API → tests**.
+Modules are listed in build order: a module comes after every module it calls or listens to
+(see the dependency graph in [ARCHITECTURE.md §2](ARCHITECTURE.md#2-modules)).
 
 ## Phase 0 — Foundation
 
-- [ ] Project docs (architecture, conventions, API guidelines, ADR-001)
-- [ ] `application.yaml` profiles (`local`, `test`, `prod`) and Postgres config
-- [ ] `shared` kernel
-  - [ ] `BaseEntity` (UUID id, auditing, version)
+- [ ] Project docs and Claude rules (architecture, API design, database design, security, ADR-001 to ADR-005)
+- [ ] `application.yaml` profiles (`local`, `test`, `prod`) with Postgres and Redis config from env
+- [ ] Dependencies: Spring Modulith 2.x BOM (`spring-modulith-starter-core`, `-starter-jpa`, `-starter-test`), Redis, WebSocket, jjwt (`jjwt-api`, `jjwt-impl`, a JSON module; see ADR-002), Razorpay SDK (or HTTP client), Testcontainers Redis
+- [ ] `common` kernel
+  - [ ] `BaseEntity` (UUID id, `createdAt`, `updatedAt`; no `version`, see `.claude/rules/java.md`)
   - [ ] `Money` value object and JPA mapping
   - [ ] `DomainException` hierarchy and `ErrorCode`
   - [ ] Global `@RestControllerAdvice` returning `ProblemDetail`
-  - [ ] Pagination envelope (offset and cursor)
+  - [ ] Pagination envelopes (offset and cursor)
   - [ ] Trace ID filter (MDC)
-- [ ] Security baseline (stateless JWT filter, password encoding, role setup)
-- [ ] Idempotency-Key support (storage, filter or aspect)
-- [ ] Outbox table and relay skeleton
+  - [ ] Idempotency-Key support
+  - [ ] `Clock` bean (UTC)
+  - [ ] Event Publication Registry: Flyway migration for `event_publication` (copied from the Modulith version's schema), `@EnableAsync`, republish on restart, completion cleanup
+- [ ] OpenAPI / Swagger UI (springdoc)
+  - [ ] `OpenApiConfig`: info, servers, `bearerAuth` security scheme
+  - [ ] One `GroupedOpenApi` per module
+  - [ ] `OpenApiCustomizer`: shared `ProblemDetail` schema and default error responses
+  - [ ] `@IdempotencyKeyHeader` meta-annotation
+  - [ ] Profile config: enabled in `local`/`dev`, disabled in `prod`; security allowlist in non-prod
+  - [ ] CI: export `target/openapi.json` as a build artifact
 - [ ] Flyway baseline migration
-- [ ] Testcontainers integration test base
+- [ ] Testcontainers integration test base (Postgres and Redis)
+- [ ] Spring Modulith: `ApplicationModules.verify()` test, `@NamedInterface` conventions, `common` as an open module
 - [ ] CI pipeline (`./mvnw verify`)
 
-## Phase 1 — Users, restaurants, menus
+## Phase 1 — Users, auth, restaurants, menus
 
-### identity
-- [ ] Migration: users, roles, addresses, refresh_tokens
-- [ ] Domain: `User`, `Address`, `RefreshToken`
-- [ ] Service: register, login, refresh, logout, profile, addresses
-- [ ] API: `/auth/*`, `/users/me`, `/users/me/addresses`
+### user
+- [ ] Migration: users, addresses
+- [ ] Domain: `User`, `Address`, account status
+- [ ] Public facade: `UserApi` (incl. `createUser` for registration, address lookup with coordinates)
+- [ ] Event: `UserBlocked`
+- [ ] API: `/users/me`, `/users/me/addresses`
+- [ ] Admin: `GET /admin/users`, `POST /admin/users/{id}/block`
+- [ ] Tests
+
+### auth
+- [ ] Migration: credentials, refresh_tokens
+- [ ] `JwtService` (jjwt) and `JwtAuthenticationFilter`, security filter chain, exact-path public allowlist
+- [ ] Register, login (rejects blocked users), refresh (rotation and reuse detection), logout
+- [ ] Login rate limiting (per IP and per account)
+- [ ] `AdminBootstrap`: first admin from `ADMIN_BOOTSTRAP_*` env vars
 - [ ] Event: `UserRegistered`
+- [ ] `TokenAuthenticator` implementation for STOMP `CONNECT` (uses `JwtService`)
+- [ ] Listener: `UserBlocked` revokes refresh tokens and calls `StompSessionRegistry.closeSessionsOf`
 - [ ] Tests
 
 ### restaurant
-- [ ] Migration: restaurants, outlets, opening_hours
-- [ ] Domain: `Restaurant`, `OpeningHours`, serviceable radius
-- [ ] Service: create, update, open/close, approval status
-- [ ] API: `/restaurants`, search by location, cuisine and rating
+- [ ] Migration: restaurants, opening_hours
+- [ ] Domain: `Restaurant`, `OpeningHours`, serviceable radius, approval status, `deliveryFee`, `packagingCharge`
+- [ ] Public facade: `RestaurantApi`
+- [ ] API: `/restaurants` (search by location, cuisine and rating), open/close
+- [ ] Admin: list, approve and suspend restaurants (`/admin/restaurants`)
 - [ ] Tests
 
-### catalog
-- [ ] Migration: menu_categories, menu_items, variants, add_ons
+### menu
+- [ ] Migration: menu_categories, menu_items, item_variants, item_add_ons
 - [ ] Domain: `MenuItem`, `Variant`, `AddOn`, availability
-- [ ] Service: menu CRUD, availability toggle
-- [ ] Public facade: `CatalogApi` (pricing lookup for cart and order)
+- [ ] Public facade: `MenuApi` (pricing lookup for cart and order)
 - [ ] API: `/restaurants/{id}/menu`, `/menu-items`, `/menu-categories`
 - [ ] Tests
 
-## Phase 2 — Cart, orders, payments
+## Phase 2 — Promotions, cart, payments, orders
+
+### promotion
+- [ ] Migration: coupons, coupon_redemptions
+- [ ] Domain: `Coupon` (FLAT, PERCENT with cap, FREE_DELIVERY), rules (validity, min subtotal, per-customer/total limits, first order), `CouponRedemption`
+- [ ] Public facade: `PromotionApi` (`evaluate`, `redeem` with row lock, `release`)
+- [ ] API: admin platform coupons, owner restaurant coupons, available coupons for customers
+- [ ] Tests (every rule, limit concurrency, release on cancel)
 
 ### cart
 - [ ] Migration: carts, cart_items
-- [ ] Domain: single-restaurant rule, totals calculation
-- [ ] Service: add, update, remove, clear
-- [ ] API: `/cart`
+- [ ] Domain: single-restaurant rule
+- [ ] `CartPricing`: subtotal, packaging, delivery fee, coupon discount (amount from `PromotionApi`), tax (`pricing.tax-percent`)
+- [ ] Public facade: `CartApi` (priced cart, `clear` at checkout)
+- [ ] API: `/cart`, `/cart/coupon`
 - [ ] Tests
 
-### order
-- [ ] Migration: orders, order_items, order_status_history
-- [ ] Domain: `Order` aggregate, state machine, pricing snapshot
-- [ ] Service: checkout, cancel, owner actions (accept, reject, preparing, ready)
-- [ ] Events: `OrderPlaced`, `OrderAccepted`, `OrderRejected`, `OrderReadyForPickup`, `OrderCancelled`
-- [ ] Listeners: payment and delivery events update status
-- [ ] API: `/orders`, `/users/me/orders`, `/restaurants/{id}/orders`
-- [ ] Tests (including every allowed and forbidden transition)
-
 ### payment
-- [ ] Migration: payments, payment_attempts, refunds, processed_webhooks
-- [ ] `PaymentGateway` interface and fake implementation
-- [ ] Razorpay (or Stripe) implementation
-- [ ] Payment intent creation
-- [ ] Webhook: signature verification and idempotent processing
+- [ ] Migration: payments, refunds, processed_webhooks
+- [ ] Public facade: `PaymentApi` (`createPayment` incl. COD, `openGatewayOrder` after commit, `cancelPayment` (refund or void), `markCollected`)
+- [ ] `PaymentGateway` interface and `FakePaymentGateway`
+- [ ] `RazorpayGateway`: create order, verify signatures, refund
+- [ ] Webhook endpoint: raw-body HMAC verification, event-ID dedupe in the same transaction
 - [ ] Events: `PaymentSucceeded`, `PaymentFailed`, `RefundIssued`
-- [ ] Payment timeout job (15 minutes)
-- [ ] Refund on reject or cancel
-- [ ] Cash on delivery flow
+- [ ] Refunds and voids via `PaymentApi.cancelPayment`, refund webhooks, auto-refund of late captures (the only place they are refunded)
+- [ ] Cash on delivery flow (`PENDING_COLLECTION` → `COLLECTED`)
 - [ ] API: `/payments/*`
 - [ ] Tests
 
-## Phase 3 — Delivery and live tracking
+### order
+- [ ] Migration: orders (incl. address snapshot and `partner_user_id`), order_items, order_status_history
+- [ ] Domain: `Order` aggregate, state machine, pricing snapshot, address snapshot
+- [ ] Public facade: `OrderApi` (`markPartnerAssigned`, `markPickedUp`, `markDelivered`, ownership and location reads)
+- [ ] Service: checkout, cancel, owner actions
+- [ ] Events: `OrderPlaced`, `OrderAccepted`, `OrderRejected`, `OrderReadyForPickup`, `OrderPickedUp`, `OrderDelivered`, `OrderCancelled`
+- [ ] Listeners: `PaymentSucceeded` (ignored unless `PAYMENT_PENDING`), `PaymentFailed` (no state change), `RefundIssued`
+- [ ] Checkout: pricing snapshot from `CartApi`, `PromotionApi.redeem` (passes `isFirstOrder`), `CartApi.clear`, then `PaymentApi.openGatewayOrder` after commit
+- [ ] Calls `PaymentApi.cancelPayment` and `PromotionApi.release` on reject, cancel and timeout, and `PaymentApi.markCollected` on COD delivery
+- [ ] Payment timeout job: cancels orders stuck in `PAYMENT_PENDING` for 15 minutes
+- [ ] API: `/orders`, `/users/me/orders`, `/restaurants/{id}/orders`
+- [ ] Tests (every allowed and forbidden transition)
+
+## Phase 3 — Delivery and real-time tracking
 
 ### delivery
 - [ ] Migration: delivery_partners, delivery_tasks, delivery_location_history
-- [ ] Domain: `DeliveryTask` lifecycle, partner availability
-- [ ] Assignment: nearest available partner, offer timeout, fallback
-- [ ] Events: `DeliveryAssigned`, `OrderPickedUp`, `OrderDelivered`
-- [ ] API: `/delivery/availability`, `/delivery-tasks/*`
+- [ ] Domain: `DeliveryTask` lifecycle, partner availability, partner approval status
+- [ ] Listener: `UserRegistered` (partner role) creates a `PENDING_APPROVAL` profile
+- [ ] Admin: list, approve and suspend partners (`/admin/delivery-partners`)
+- [ ] Redis GEO: partner availability index, latest-location hash, sweeper for expired heartbeats
+- [ ] Assignment: `GEOSEARCH` nearest partner, offer timeout, fallback, offer lock
+- [ ] `DeliveryAssignmentStalled` alert after `delivery.assignment.alert-after`; maximum search radius
+- [ ] Delivery OTP: generate with `SecureRandom`, show only to the customer in the tracking snapshot, verify on delivery (5 attempts), clear when the task ends
+- [ ] Listeners: `OrderReadyForPickup` starts assignment, `OrderCancelled` cancels the task
+- [ ] Event: `DeliveryAssigned`; calls `OrderApi.markPartnerAssigned`, `markPickedUp`, `markDelivered`
+- [ ] API: `/delivery/availability`, `/delivery/location` (rate-limited), `/delivery-tasks/*`
 - [ ] Tests
 
-### tracking
-- [ ] Location ping endpoint, validation and rate limiting
-- [ ] `LocationStore` (in-memory) for latest positions
-- [ ] Sampled location history persistence
+### tracking (WebSocket STOMP)
+- [ ] STOMP config in `common` (`/ws`, `/app`, `/topic`, `/user/queue`), the `TokenAuthenticator` and `SubscriptionAuthorizer` SPIs, and `StompSessionRegistry` with an expiry sweep
+- [ ] `SubscriptionAuthorizer` implementations (`delivery` for tracking, `notification` for the restaurant dashboard)
+- [ ] `TrackingPublisher` (in `delivery`): status pushes from `READY_FOR_PICKUP`, plus location and ETA once assigned
 - [ ] `EtaCalculator` (haversine)
-- [ ] SSE emitter registry and `GET /orders/{id}/tracking`
+- [ ] Sampled location history persistence
+- [ ] Tracking snapshot endpoint `GET /orders/{id}/tracking`
 - [ ] Tests
 
-## Phase 4 — Notifications and reviews
+## Phase 4 — Notifications and admin
 
 ### notification
 - [ ] Migration: notification_log
 - [ ] Email templates (welcome, order placed, out for delivery, delivered, refund)
 - [ ] Event listeners for the event catalog
+- [ ] WebSocket pushes: restaurant dashboard and `/user/queue/notifications` (no order-status tracking)
 - [ ] Tests (fake mail sender)
 
-### review
-- [ ] Migration: reviews
-- [ ] Domain: one review per order, only after `DELIVERED`
-- [ ] Restaurant rating aggregation
-- [ ] API: `/orders/{id}/reviews`, `/restaurants/{id}/reviews`
-- [ ] Tests
-
 ### admin
-- [ ] Restaurant approval and suspension
-- [ ] User blocking
+Restaurant approval (Phase 1), user blocking (Phase 1) and partner approval (Phase 3) are built
+with their modules, because earlier phases need them.
+- [ ] Admin cancellation from any non-terminal order state
 - [ ] Order search
 
 ## Phase 5 — Hardening
 
-- [ ] Outbox relay with retries and a dead-letter state
-- [ ] Rate limiting (auth, location pings)
+- [ ] Monitoring and alerting on incomplete event publications; scheduled resubmission
+- [ ] Rate limiting for checkout; review the limits added earlier (login, location pings)
 - [ ] Caching (restaurant search, menus)
+- [ ] Multi-instance STOMP fan-out (Redis pub/sub or a broker relay)
+- [ ] Single-run scheduled jobs across instances (e.g. ShedLock) for the payment timeout, assignment and GEO sweeper
 - [ ] Observability: metrics, structured logging, dashboards
-- [ ] Module boundary verification (Spring Modulith or ArchUnit)
-- [ ] Security review (OWASP checks, secrets management)
+- [ ] Security review (OWASP checks, dependency scanning, secrets management)
 - [ ] Load testing (checkout and tracking)
-- [ ] Redis for location store and SSE fan-out (multi-instance)
 - [ ] Deployment setup (Docker image, environment config)
+
+## Future
+
+- [ ] `review` module: ratings and reviews for restaurants and delivery partners
+- [ ] Push and SMS notifications
+- [ ] Maps-provider ETA
